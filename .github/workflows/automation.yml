@@ -37,7 +37,6 @@ jobs:
               -o StrictHostKeyChecking=yes \
               -o UserKnownHostsFile=~/.ssh/known_hosts \
               ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
-
           set -euo pipefail
 
           echo "=== [Step 1] Updating packages ==="
@@ -95,16 +94,23 @@ jobs:
           echo "=== [Step 6] Install ArgoCD ==="
           kubectl create namespace argocd || true
           kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-
-          echo "=== [Step 7] Wait for ArgoCD pods to be ready ==="
           kubectl wait --for=condition=available --timeout=600s deployment/argocd-server -n argocd
-
-          echo "=== [Step 8] Expose ArgoCD via LoadBalancer ==="
           kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}' || true
 
-          echo "=== [Step 9] Deploy Monitoring Stack (Prometheus + Grafana) ==="
+          echo "=== [Step 7] Deploy Monitoring Stack (Prometheus + Grafana) ==="
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+          kubectl wait --for=condition=available --timeout=600s deployment/kube-prometheus-stack-kube-prometheus-stack-prometheus -n monitoring || true
 
+          echo "=== [Step 8] Install NGINX Ingress Controller ==="
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace
+          kubectl wait --for=condition=available --timeout=300s deployment/ingress-nginx-controller -n ingress-nginx
+
+          echo "=== [Step 9] Verify all installations ==="
+          kubectl get pods -n argocd
+          kubectl get pods -n monitoring
+          kubectl get pods -n ingress-nginx
           REMOTE
