@@ -40,13 +40,17 @@ jobs:
           sudo apt-get install -y curl jq unzip
 
           echo "=== [Step 2] Install Tools (Azure CLI, kubectl, Helm, Terraform) ==="
-          if ! command -v az >/dev/null 2>&1; then curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash; fi
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER=$(curl -s https://dl.k8s.io/release/stable.txt)
             curl -LO "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
             sudo install -m 0755 kubectl /usr/local/bin/kubectl
           fi
-          if ! command -v helm >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash; fi
+          if ! command -v helm >/dev/null 2>&1; then
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          fi
           if ! command -v terraform >/dev/null 2>&1; then
             TV="1.9.8"
             curl -LO "https://releases.hashicorp.com/terraform/${TV}/terraform_${TV}_linux_amd64.zip"
@@ -54,26 +58,23 @@ jobs:
             sudo mv terraform /usr/local/bin/
             rm terraform_${TV}_linux_amd64.zip
           fi
+          if ! command -v argocd >/dev/null 2>&1; then
+            curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            chmod +x argocd
+            sudo mv argocd /usr/local/bin/
+          fi
 
           echo "=== [Step 3] Verify Installed Versions ==="
           echo "Azure CLI version:" 
           az version | jq -r '.["azure-cli"]'
-
-          echo "kubectl version:"
+          echo "kubectl version:" 
           kubectl version --client=true --output=yaml
-
-          echo "Helm version:"
+          echo "Helm version:" 
           helm version --short
-
-          echo "Terraform version:"
+          echo "Terraform version:" 
           terraform version
-
-          echo "ArgoCD CLI version (if installed):"
-          if command -v argocd >/dev/null 2>&1; then
-            argocd version --client
-          else
-            echo "ArgoCD CLI not installed yet"
-          fi
+          echo "ArgoCD CLI version:" 
+          argocd version --client
 
           echo "=== [Step 4] Connect to AKS Cluster ==="
           az aks get-credentials -n dev-aks -g dev-rg-aks --overwrite-existing
@@ -87,7 +88,7 @@ jobs:
             terraform apply -auto-approve tfplan
           fi
 
-          echo "=== [Step 6] Install ArgoCD ==="
+          echo "=== [Step 6] Install ArgoCD in AKS ==="
           kubectl create namespace argocd || true
           kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
@@ -101,4 +102,5 @@ jobs:
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+
           REMOTE
