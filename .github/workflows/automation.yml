@@ -1,4 +1,4 @@
-name: AKS Bastion Setup & Deploy Apps
+name: AKS Bastion Setup & Deploy Infra + Apps
 
 on:
   push:
@@ -15,7 +15,13 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
-      # 2. Prepare SSH key for Bastion (supports multi-line PEM)
+      # 2. Azure Login using AZURE_CREDENTIALS JSON secret
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 3. Prepare SSH key for Bastion
       - name: Prepare SSH key
         run: |
           mkdir -p ~/.ssh
@@ -23,56 +29,59 @@ jobs:
           chmod 600 ~/.ssh/bastion.pem
           ssh-keyscan -H ${{ secrets.BASTION_HOST }} >> ~/.ssh/known_hosts
 
-      # 3. SSH into Bastion and run commands
-      - name: Connect to Bastion and Install Tools
+      # 4. SSH into Bastion and run commands
+      - name: Connect to Bastion and Setup Tools + Deploy
         run: |
           ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
           set -euo pipefail
 
-          echo "Updating packages..."
+          echo "=== Updating packages ==="
           sudo apt-get update -y
-          sudo apt-get install -y curl jq
+          sudo apt-get install -y curl jq unzip
 
-          echo "Installing Azure CLI if not installed..."
-          if ! command -v az >/dev/null 2>&1; then
-            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          fi
-
-          echo "Installing kubectl if not installed..."
+          echo "=== Install Azure CLI, kubectl, Helm, Terraform if not present ==="
+          if ! command -v az >/dev/null 2>&1; then curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash; fi
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER=$(curl -s https://dl.k8s.io/release/stable.txt)
             curl -LO "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
             sudo install -m 0755 kubectl /usr/local/bin/kubectl
           fi
-
-          echo "Installing Helm if not installed..."
-          if ! command -v helm >/dev/null 2>&1; then
-            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          if ! command -v helm >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash; fi
+          if ! command -v terraform >/dev/null 2>&1; then
+            TV="1.9.8"
+            curl -LO "https://releases.hashicorp.com/terraform/${TV}/terraform_${TV}_linux_amd64.zip"
+            unzip terraform_${TV}_linux_amd64.zip
+            sudo mv terraform /usr/local/bin/
+            rm terraform_${TV}_linux_amd64.zip
           fi
 
-          echo "Handling Azure credentials..."
-          echo '${{ secrets.AZURE_CREDENTIALS }}' | sed 's/\\n/\n/g' > creds.json
+          echo "=== Azure login is handled by GitHub Action, reusing creds ==="
+          az account show
 
-          # Validate JSON
-          cat creds.json | jq . || { echo "AZURE_CREDENTIALS is not valid JSON"; exit 1; }
-
-          # Parse Azure Service Principal fields
-          CLIENT_ID=$(jq -r .clientId creds.json)
-          CLIENT_SECRET=$(jq -r .clientSecret creds.json)
-          TENANT_ID=$(jq -r .tenantId creds.json)
-          SUBSCRIPTION_ID=$(jq -r .subscriptionId creds.json)
-
-          # Login to Azure
-          az login --service-principal --username "$CLIENT_ID" --password "$CLIENT_SECRET" --tenant "$TENANT_ID"
-          az account set --subscription "$SUBSCRIPTION_ID"
-
-          echo "Connecting to existing AKS cluster..."
+          echo "=== Connect to AKS cluster ==="
           az aks get-credentials -n dev-aks -g dev-rg-aks --overwrite-existing
           kubectl get nodes
 
-          echo "Deploying Helm apps (Prometheus monitoring example)..."
+          echo "=== Run Terraform (if infra folder present) ==="
+          if [ -d ~/infra ]; then
+            cd ~/infra
+            terraform init
+            terraform plan -out=tfplan
+            terraform apply -auto-approve tfplan
+          fi
+
+          echo "=== Install ArgoCD ==="
+          kubectl create namespace argocd || true
+          kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+          echo "=== Wait for ArgoCD pods to be ready ==="
+          kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+          echo "=== (Optional) Expose ArgoCD via LoadBalancer ==="
+          kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+
+          echo "=== Deploy monitoring stack via Helm (GitOps or direct) ==="
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
-
           REMOTE
