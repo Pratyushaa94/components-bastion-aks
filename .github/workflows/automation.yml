@@ -7,21 +7,19 @@ on:
   workflow_dispatch:
 
 jobs:
-  bastion-aks-deploy:
+  setup-bastion:
     runs-on: ubuntu-latest
-
+    outputs:
+      bastion: ${{ steps.set-output.outputs.bastion_host }}
     steps:
-      # 1. Checkout repo
-      - name: Checkout Repository
+      - name: Checkout repo
         uses: actions/checkout@v3
 
-      # 2. Azure Login using AZURE_CREDENTIALS JSON secret
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 3. Prepare SSH key for Bastion
       - name: Prepare SSH key
         run: |
           mkdir -p ~/.ssh
@@ -29,28 +27,46 @@ jobs:
           chmod 600 ~/.ssh/bastion.pem
           ssh-keyscan -H ${{ secrets.BASTION_HOST }} >> ~/.ssh/known_hosts
 
-      # 4. SSH into Bastion and run setup + deployment
-      - name: Connect to Bastion and Setup Tools + Deploy
+      - name: Install Azure CLI and kubectl
         run: |
           ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
           set -euo pipefail
-
-          echo "=== [Step 1] Updating packages ==="
-          sudo apt-get update -y
-          sudo apt-get install -y curl jq unzip
-
-          echo "=== [Step 2] Install Tools (Azure CLI, kubectl, Helm, Terraform) ==="
-          if ! command -v az >/dev/null 2>&1; then
-            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          fi
+          echo "Installing Azure CLI..."
+          if ! command -v az >/dev/null 2>&1; then curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash; fi
+          echo "Installing kubectl..."
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER=$(curl -s https://dl.k8s.io/release/stable.txt)
             curl -LO "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
             sudo install -m 0755 kubectl /usr/local/bin/kubectl
           fi
+          REMOTE
+
+  install-helm:
+    runs-on: ubuntu-latest
+    needs: setup-bastion
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Install Helm
+        run: |
+          ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "Installing Helm..."
           if ! command -v helm >/dev/null 2>&1; then
             curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi
+          REMOTE
+
+  install-terraform:
+    runs-on: ubuntu-latest
+    needs: setup-bastion
+    steps:
+      - name: Install Terraform
+        run: |
+          ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "Installing Terraform..."
           if ! command -v terraform >/dev/null 2>&1; then
             TV="1.9.8"
             curl -LO "https://releases.hashicorp.com/terraform/${TV}/terraform_${TV}_linux_amd64.zip"
@@ -58,49 +74,59 @@ jobs:
             sudo mv terraform /usr/local/bin/
             rm terraform_${TV}_linux_amd64.zip
           fi
+          REMOTE
+
+  install-argocd:
+    runs-on: ubuntu-latest
+    needs: [setup-bastion, install-helm]
+    steps:
+      - name: Install ArgoCD CLI and deploy ArgoCD
+        run: |
+          ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "Installing ArgoCD CLI..."
           if ! command -v argocd >/dev/null 2>&1; then
             curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
             chmod +x argocd
             sudo mv argocd /usr/local/bin/
           fi
-
-          echo "=== [Step 3] Verify Installed Versions ==="
-          echo "Azure CLI version:" 
-          az version | jq -r '.["azure-cli"]'
-          echo "kubectl version:" 
-          kubectl version --client=true --output=yaml
-          echo "Helm version:" 
-          helm version --short
-          echo "Terraform version:" 
-          terraform version
-          echo "ArgoCD CLI version:" 
-          argocd version --client
-
-          echo "=== [Step 4] Connect to AKS Cluster ==="
-          az aks get-credentials -n dev-aks -g dev-rg-aks --overwrite-existing
-          kubectl get nodes
-
-          echo "=== [Step 5] Run Terraform (if infra folder present) ==="
-          if [ -d ~/infra ]; then
-            cd ~/infra
-            terraform init
-            terraform plan -out=tfplan
-            terraform apply -auto-approve tfplan
-          fi
-
-          echo "=== [Step 6] Install ArgoCD in AKS ==="
+          echo "Deploying ArgoCD in AKS..."
           kubectl create namespace argocd || true
           kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-
-          echo "=== [Step 7] Wait for ArgoCD pods to be ready ==="
           kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
-
-          echo "=== [Step 8] Expose ArgoCD via LoadBalancer ==="
           kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}' || true
+          REMOTE
 
-          echo "=== [Step 9] Deploy Monitoring Stack (Prometheus + Grafana) ==="
+  deploy-monitoring:
+    runs-on: ubuntu-latest
+    needs: [install-helm]
+    steps:
+      - name: Deploy Prometheus + Grafana
+        run: |
+          ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "Deploying Monitoring Stack..."
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+          REMOTE
 
+  verify-versions:
+    runs-on: ubuntu-latest
+    needs: [setup-bastion, install-helm, install-terraform, install-argocd]
+    steps:
+      - name: Verify Installed Versions
+        run: |
+          ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo "=== Installed Versions ==="
+          echo "Azure CLI: $(az version | jq -r '.["azure-cli"]')"
+          echo "kubectl: $(kubectl version --client=true --output=yaml)"
+          echo "Helm: $(helm version --short)"
+          echo "Terraform: $(terraform version)"
+          if command -v argocd >/dev/null 2>&1; then
+            echo "ArgoCD CLI: $(argocd version --client)"
+          else
+            echo "ArgoCD CLI not installed"
+          fi
           REMOTE
