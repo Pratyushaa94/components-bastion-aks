@@ -15,11 +15,11 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
-      # 2. Prepare SSH key for Bastion
+      # 2. Prepare SSH key for Bastion (supports multi-line PEM)
       - name: Prepare SSH key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.BASTION_KEY }}" > ~/.ssh/bastion.pem
+          echo "${{ secrets.BASTION_KEY }}" | sed 's/\\n/\n/g' > ~/.ssh/bastion.pem
           chmod 600 ~/.ssh/bastion.pem
           ssh-keyscan -H ${{ secrets.BASTION_HOST }} >> ~/.ssh/known_hosts
 
@@ -29,41 +29,48 @@ jobs:
           ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
           set -euo pipefail
 
-          # Update packages
+          echo "Updating packages..."
           sudo apt-get update -y
           sudo apt-get install -y curl jq
 
-          # Azure CLI
+          echo "Installing Azure CLI if not installed..."
           if ! command -v az >/dev/null 2>&1; then
             curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
           fi
 
-          # kubectl
+          echo "Installing kubectl if not installed..."
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER=$(curl -s https://dl.k8s.io/release/stable.txt)
             curl -LO "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
             sudo install -m 0755 kubectl /usr/local/bin/kubectl
           fi
 
-          # Helm
+          echo "Installing Helm if not installed..."
           if ! command -v helm >/dev/null 2>&1; then
             curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi
 
-          # Azure login
-          echo "${{ secrets.AZURE_CREDENTIALS }}" > creds.json
+          echo "Handling Azure credentials..."
+          echo '${{ secrets.AZURE_CREDENTIALS }}' | sed 's/\\n/\n/g' > creds.json
+
+          # Validate JSON
+          cat creds.json | jq . || { echo "AZURE_CREDENTIALS is not valid JSON"; exit 1; }
+
+          # Parse Azure Service Principal fields
           CLIENT_ID=$(jq -r .clientId creds.json)
           CLIENT_SECRET=$(jq -r .clientSecret creds.json)
           TENANT_ID=$(jq -r .tenantId creds.json)
           SUBSCRIPTION_ID=$(jq -r .subscriptionId creds.json)
+
+          # Login to Azure
           az login --service-principal --username "$CLIENT_ID" --password "$CLIENT_SECRET" --tenant "$TENANT_ID"
           az account set --subscription "$SUBSCRIPTION_ID"
 
-          # Connect to existing AKS
+          echo "Connecting to existing AKS cluster..."
           az aks get-credentials -n dev-aks -g dev-rg-aks --overwrite-existing
           kubectl get nodes
 
-          # Deploy Helm apps (example: Prometheus monitoring)
+          echo "Deploying Helm apps (Prometheus monitoring example)..."
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
