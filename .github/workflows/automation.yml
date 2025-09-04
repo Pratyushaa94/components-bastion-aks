@@ -35,11 +35,11 @@ jobs:
           ssh -i ~/.ssh/bastion.pem -o StrictHostKeyChecking=yes ${{ secrets.BASTION_USER }}@${{ secrets.BASTION_HOST }} 'bash -s' <<'REMOTE'
           set -euo pipefail
 
-          echo "=== Updating packages ==="
+          echo "=== [Step 1] Update Packages ==="
           sudo apt-get update -y
           sudo apt-get install -y curl jq unzip
 
-          echo "=== Install Azure CLI, kubectl, Helm, Terraform if not present ==="
+          echo "=== [Step 2] Install Tools (Azure CLI, kubectl, Helm, Terraform) ==="
           if ! command -v az >/dev/null 2>&1; then curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash; fi
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER=$(curl -s https://dl.k8s.io/release/stable.txt)
@@ -55,33 +55,37 @@ jobs:
             rm terraform_${TV}_linux_amd64.zip
           fi
 
-          echo "=== Azure login is handled by GitHub Action, reusing creds ==="
-          az account show
+          echo "=== [Step 3] Verify Installed Versions ==="
+          az version | jq '.["azure-cli"]'
+          kubectl version --client --short
+          helm version --short
+          terraform version
 
-          echo "=== Connect to AKS cluster ==="
+          echo "=== [Step 4] Connect to AKS Cluster ==="
           az aks get-credentials -n dev-aks -g dev-rg-aks --overwrite-existing
-          kubectl get nodes
+          kubectl get nodes -o wide
 
-          echo "=== Run Terraform (if infra folder present) ==="
+          echo "=== [Step 5] Terraform Infra Deployment ==="
           if [ -d ~/infra ]; then
             cd ~/infra
             terraform init
             terraform plan -out=tfplan
             terraform apply -auto-approve tfplan
+          else
+            echo "⚠️ No ~/infra folder found, skipping Terraform"
           fi
 
-          echo "=== Install ArgoCD ==="
+          echo "=== [Step 6] ArgoCD Installation ==="
           kubectl create namespace argocd || true
           kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-
-          echo "=== Wait for ArgoCD pods to be ready ==="
           kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
-
-          echo "=== (Optional) Expose ArgoCD via LoadBalancer ==="
           kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+          echo "✅ ArgoCD Installed"
 
-          echo "=== Deploy monitoring stack via Helm (GitOps or direct) ==="
+          echo "=== [Step 7] Helm Deployment (Monitoring Stack) ==="
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+          echo "✅ Monitoring Installed"
+
           REMOTE
